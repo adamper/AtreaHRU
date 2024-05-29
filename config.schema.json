@@ -1,0 +1,39 @@
+{
+  "pluginAlias": "AtreaHRU",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "title": "Název",
+        "default": "AtreaHRU"
+      },
+      "ip": {
+        "type": "string",
+        "title": "IP adresa",
+        "description": "IP adresa zařízení"
+      },
+      "port": {
+        "type": "integer",
+        "title": "Port",
+        "description": "Port TCP (výchozí 502)",
+        "default": 502
+      },
+      "regimeRegister": {
+        "type": "integer",
+        "title": "Režim",
+        "description": "Adresa režimu pro zapnutí/vypnutí ventilátoru",
+        "default": 1001
+      },
+      "speedRegister": {
+        "type": "integer",
+        "title": "Rychlostní registr",
+        "description": "Adresa registru pro nastavení rychlosti ventilátoru",
+        "default": 1004
+      }
+    },
+    "required": ["name", "ip", "port", "regimeRegister", "speedRegister"]
+  }
+}
