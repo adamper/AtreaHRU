@@ -5,7 +5,7 @@ import { Service, PlatformAccessory } from 'homebridge';
 
 import { HRUPlatform } from './platform';
 
-const ModbusRTU = require('./modbus-serial');
+const ModbusRTU = require('modbus-serial');
 const client = new ModbusRTU();
 
 /**
