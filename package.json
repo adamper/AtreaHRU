@@ -23,6 +23,9 @@
   "keywords": [
     "homebridge-plugin"
   ],
+  "dependencies": {
+    "modbus-serial": "^8.0.16"
+  },
   "devDependencies": {
     "@types/node": "^20.12.7",
     "@typescript-eslint/eslint-plugin": "^7.7.0",
