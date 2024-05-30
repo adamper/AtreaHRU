@@ -26,10 +26,10 @@ export class HRUPlatform implements DynamicPlatformPlugin {
     public readonly api: API,
   ) {
 
-    this.ip             =           this.config.ip;
-    this.port           =           this.config.port;
-    this.regimeRegister =           this.config.regimeRegister;
-    this.speedRegister  =           this.config.speedRegister;
+    this.ip = this.config.ip;
+    this.port = this.config.port;
+    this.regimeRegister = this.config.regimeRegister;
+    this.speedRegister = this.config.speedRegister;
 
     this.log.debug('Finished initializing platform:', this.config.name);
 
@@ -75,7 +75,7 @@ export class HRUPlatform implements DynamicPlatformPlugin {
       {
         exampleUniqueId: 'XZY',
         exampleDisplayName: 'AtreaHRU',
-      }
+      },
     ];
 
     // loop over the discovered devices and register each one if it has not already been registered
