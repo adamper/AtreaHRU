@@ -6,15 +6,15 @@ export class HRUAccessory {
   private service: Service;
   private client: ModbusRTU;
   private isConnected: boolean = false;
+  private connectionTimeout: NodeJS.Timeout | null = null;
+  private readonly DISCONNECT_TIMEOUT = 60000; // Disconnect after 60 seconds of inactivity
+  private readonly RECONNECT_DELAY = 5000; // Wait 5 seconds before reconnecting
 
   constructor(
     private readonly platform: HRUPlatform,
     private readonly accessory: PlatformAccessory,
   ) {
     this.client = new ModbusRTU();
-    this.connectModbusClient().catch(error => {
-      this.platform.log.error('Failed to establish initial Modbus connection:', error);
-    });
 
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
       .setCharacteristic(this.platform.Characteristic.Manufacturer, 'HRU Manufacturer')
@@ -35,11 +35,17 @@ export class HRUAccessory {
   }
 
   private async connectModbusClient(): Promise<void> {
+    if (this.isConnected) {
+      this.resetDisconnectTimeout();
+      return;
+    }
+
     try {
       this.platform.log.debug(`Attempting to connect to Modbus device at ${this.platform.ip}:${this.platform.port}`);
       await this.client.connectTCP(this.platform.ip, { port: this.platform.port, timeout: 10000 });
       this.isConnected = true;
       this.platform.log.info(`Successfully connected to Modbus device at ${this.platform.ip}:${this.platform.port}`);
+      this.resetDisconnectTimeout();
     } catch (error) {
       this.isConnected = false;
       if (error instanceof Error) {
@@ -51,9 +57,33 @@ export class HRUAccessory {
     }
   }
 
+  private resetDisconnectTimeout() {
+    if (this.connectionTimeout) {
+      clearTimeout(this.connectionTimeout);
+    }
+    
+    this.connectionTimeout = setTimeout(async () => {
+      await this.disconnect();
+    }, this.DISCONNECT_TIMEOUT);
+  }
+
+  private async disconnect() {
+    if (this.isConnected) {
+      try {
+        await this.client.close();
+        this.isConnected = false;
+        this.platform.log.debug('Disconnected from Modbus device due to inactivity');
+      } catch (error) {
+        this.platform.log.error('Error disconnecting from Modbus device:', error);
+      }
+    }
+  }
+
   private async ensureConnection() {
     if (!this.isConnected) {
       await this.connectModbusClient();
+    } else {
+      this.resetDisconnectTimeout();
     }
   }
 
@@ -65,8 +95,10 @@ export class HRUAccessory {
         this.platform.log.debug('State is:', currentValue);
         callback(null, currentValue);
       })
-      .catch(error => {
+      .catch(async error => {
         this.platform.log.error('Error getting On state:', error);
+        this.isConnected = false;
+        await new Promise(resolve => setTimeout(resolve, this.RECONNECT_DELAY));
         callback(error);
       });
   }
@@ -81,8 +113,10 @@ export class HRUAccessory {
         this.platform.log.debug(`Set On state to: ${value}`);
         callback(null);
       })
-      .catch(error => {
+      .catch(async error => {
         this.platform.log.error('Error setting On state:', error);
+        this.isConnected = false;
+        await new Promise(resolve => setTimeout(resolve, this.RECONNECT_DELAY));
         callback(error);
       });
   }
@@ -95,8 +129,10 @@ export class HRUAccessory {
         this.platform.log.debug('Speed is:', currentValue);
         callback(null, currentValue);
       })
-      .catch(error => {
+      .catch(async error => {
         this.platform.log.error('Error getting Speed:', error);
+        this.isConnected = false;
+        await new Promise(resolve => setTimeout(resolve, this.RECONNECT_DELAY));
         callback(error);
       });
   }
@@ -117,8 +153,10 @@ export class HRUAccessory {
         this.platform.log.debug(`Set Speed to: ${value}`);
         callback(null);
       })
-      .catch(error => {
+      .catch(async error => {
         this.platform.log.error('Error setting Speed:', error);
+        this.isConnected = false;
+        await new Promise(resolve => setTimeout(resolve, this.RECONNECT_DELAY));
         callback(error);
       });
   }
