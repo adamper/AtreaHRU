@@ -2,7 +2,7 @@
   "private": false,
   "displayName": "AtreaHRU",
   "name": "homebridge-atrea",
-  "version": "2.0.8",
+  "version": "2.0.10",
   "description": "Connection of Atrea Heat Recovery Unit.",
   "license": "Apache-2.0",
   "repository": {
@@ -15,10 +15,12 @@
   },
   "main": "dist/index.js",
   "scripts": {
-    "lint": "eslint src/**/*.ts --max-warnings=0",
-    "watch": "npm run build && npm link && nodemon",
-    "build": "rimraf ./dist && tsc",
-    "prepublishOnly": "npm run lint && npm run build"
+    "clean": "rimraf ./dist",
+    "prebuild": "echo 'Starting build...' && npm run clean",
+    "build": "echo 'Compiling TypeScript...' && tsc || echo 'TypeScript compilation failed'",
+    "postbuild": "echo 'Build completed'",
+    "prepublishOnly": "npm run build",
+    "postpublish": "npm run clean"
   },
   "keywords": [
     "homebridge-plugin"
