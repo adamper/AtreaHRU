@@ -7,9 +7,11 @@ export class HRUAccessory {
   private client: ModbusRTU;
   private isConnected: boolean = false;
   private connectionTimeout: NodeJS.Timeout | null = null;
-  private readonly DISCONNECT_TIMEOUT = 60000; // 60 seconds
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private readonly DISCONNECT_TIMEOUT = 30000; // 30 seconds
   private readonly RECONNECT_DELAY = 5000; // 5 seconds
-  private readonly OPERATION_TIMEOUT = 5000; // 5 seconds for operations
+  private readonly OPERATION_TIMEOUT = 3000; // 3 seconds for operations
+  private readonly MAX_RETRIES = 2;
   private operationInProgress: boolean = false;
 
   constructor(
@@ -28,17 +30,73 @@ export class HRUAccessory {
     this.service.setCharacteristic(this.platform.Characteristic.Name, 'HRU Fan');
 
     this.service.getCharacteristic(this.platform.Characteristic.On)
-      .on('get', this.handleOnGetOn.bind(this))
-      .on('set', this.handleOnSetOn.bind(this));
+      .on('get', this.createQuickResponseHandler(this.handleOnGetOn.bind(this)))
+      .on('set', this.createQuickResponseHandler(this.handleOnSetOn.bind(this)));
 
     this.service.getCharacteristic(this.platform.Characteristic.RotationSpeed)
-      .on('get', this.handleOnGetSpeed.bind(this))
-      .on('set', this.handleOnSetSpeed.bind(this))
+      .on('get', this.createQuickResponseHandler(this.handleOnGetSpeed.bind(this)))
+      .on('set', this.createQuickResponseHandler(this.handleOnSetSpeed.bind(this)))
       .setProps({
         minValue: 0,
         maxValue: 100,
         minStep: 1
       });
+
+    // Initial connection
+    this.connectWithRetry();
+  }
+
+  private createQuickResponseHandler(handler: Function) {
+    return (...args: any[]) => {
+      const callback = args[args.length - 1];
+      const startTime = Date.now();
+      
+      // Set a timeout to ensure we always respond
+      const timeoutId = setTimeout(() => {
+        this.platform.log.warn('Operation timed out, responding with cached or default value');
+        if (handler.name.includes('Get')) {
+          callback(null, 0); // Default value for gets
+        } else {
+          callback(null); // Default response for sets
+        }
+      }, this.OPERATION_TIMEOUT);
+
+      // Call the actual handler
+      handler(...args)
+        .catch(error => {
+          this.platform.log.error(`Handler error: ${error.message}`);
+          return null;
+        })
+        .finally(() => {
+          clearTimeout(timeoutId);
+          const duration = Date.now() - startTime;
+          if (duration > 1000) {
+            this.platform.log.warn(`Operation took ${duration}ms to complete`);
+          }
+        });
+    };
+  }
+
+  private async connectWithRetry(retryCount = 0): Promise<void> {
+    try {
+      if (this.isConnected) {
+        return;
+      }
+
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+
+      await this.connectModbusClient();
+    } catch (error) {
+      this.platform.log.error(`Connection attempt ${retryCount + 1} failed:`, error);
+      if (retryCount < this.MAX_RETRIES) {
+        this.reconnectTimer = setTimeout(() => {
+          this.connectWithRetry(retryCount + 1);
+        }, this.RECONNECT_DELAY);
+      }
+    }
   }
 
   private async connectModbusClient(): Promise<void> {
@@ -48,17 +106,24 @@ export class HRUAccessory {
     }
 
     try {
-      this.platform.log.debug(`Attempting to connect to Modbus device at ${this.platform.ip}:${this.platform.port}`);
-      await Promise.race([
-        this.client.connectTCP(this.platform.ip, { port: this.platform.port }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), this.OPERATION_TIMEOUT))
-      ]);
+      await new Promise<void>((resolve, reject) => {
+        const connectTimeout = setTimeout(() => {
+          reject(new Error('Connection timeout'));
+        }, this.OPERATION_TIMEOUT);
+
+        this.client.connectTCP(this.platform.ip, { port: this.platform.port })
+          .then(() => {
+            clearTimeout(connectTimeout);
+            resolve();
+          })
+          .catch(reject);
+      });
+
       this.isConnected = true;
-      this.platform.log.info(`Successfully connected to Modbus device at ${this.platform.ip}:${this.platform.port}`);
+      this.platform.log.info(`Connected to Modbus device at ${this.platform.ip}:${this.platform.port}`);
       this.resetDisconnectTimeout();
     } catch (error) {
       this.isConnected = false;
-      this.platform.log.error(`Failed to connect to Modbus device: ${error}`);
       throw error;
     }
   }
@@ -68,142 +133,94 @@ export class HRUAccessory {
       clearTimeout(this.connectionTimeout);
     }
     
-    this.connectionTimeout = setTimeout(async () => {
-      await this.disconnect();
+    this.connectionTimeout = setTimeout(() => {
+      this.disconnect()
+        .catch(error => this.platform.log.error('Error during disconnect:', error));
     }, this.DISCONNECT_TIMEOUT);
   }
 
   private async disconnect(): Promise<void> {
-    if (this.isConnected) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          this.client.close((error: Error | null) => {
-            if (error) {
-              reject(error);
-            } else {
-              resolve();
-            }
-          });
-        });
-        this.isConnected = false;
-        this.platform.log.debug('Disconnected from Modbus device due to inactivity');
-      } catch (error) {
-        this.platform.log.error('Error disconnecting from Modbus device:', error);
-      } finally {
+    if (!this.isConnected) {
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      this.client.close((error: Error | null) => {
+        if (error) {
+          this.platform.log.error('Error closing connection:', error);
+        }
         this.isConnected = false;
         if (this.connectionTimeout) {
           clearTimeout(this.connectionTimeout);
           this.connectionTimeout = null;
         }
-      }
-    }
+        resolve();
+      });
+    });
   }
 
-  private async ensureConnection() {
-    if (this.operationInProgress) {
-      throw new Error('Operation already in progress');
-    }
-    
+  private async ensureConnection(): Promise<void> {
     if (!this.isConnected) {
-      await this.connectModbusClient();
+      await this.connectWithRetry();
     } else {
       this.resetDisconnectTimeout();
     }
   }
 
-  private async executeWithTimeout<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.operationInProgress) {
-      throw new Error('Operation already in progress');
-    }
-
-    this.operationInProgress = true;
+  async handleOnGetOn(callback: CharacteristicGetCallback) {
     try {
-      const result = await Promise.race([
-        operation(),
-        new Promise<T>((_, reject) => 
-          setTimeout(() => reject(new Error('Operation timeout')), this.OPERATION_TIMEOUT)
-        )
-      ]);
-      return result;
-    } finally {
-      this.operationInProgress = false;
-    }
-  }
-
-  handleOnGetOn(callback: CharacteristicGetCallback) {
-    const operation = async () => {
       await this.ensureConnection();
       const response = await this.client.readHoldingRegisters(this.platform.regimeRegister, 1);
       const currentValue = response.data[0] === 0 ? 0 : 1;
-      this.platform.log.debug('State is:', currentValue);
-      return currentValue;
-    };
-
-    this.executeWithTimeout(operation)
-      .then(value => callback(null, value))
-      .catch(error => {
-        this.platform.log.error('Error getting On state:', error);
-        this.isConnected = false;
-        callback(error);
-      });
+      callback(null, currentValue);
+    } catch (error) {
+      this.platform.log.error('Error getting On state:', error);
+      this.isConnected = false;
+      callback(error);
+    }
   }
 
-  handleOnSetOn(value: CharacteristicValue, callback: CharacteristicSetCallback) {
-    const operation = async () => {
+  async handleOnSetOn(value: CharacteristicValue, callback: CharacteristicSetCallback) {
+    try {
       await this.ensureConnection();
       const setValue = (value as number) >= 1 ? 2 : 0;
       await this.client.writeRegister(this.platform.regimeRegister, setValue);
-      this.platform.log.debug(`Set On state to: ${value}`);
-    };
-
-    this.executeWithTimeout(operation)
-      .then(() => callback(null))
-      .catch(error => {
-        this.platform.log.error('Error setting On state:', error);
-        this.isConnected = false;
-        callback(error);
-      });
+      callback(null);
+    } catch (error) {
+      this.platform.log.error('Error setting On state:', error);
+      this.isConnected = false;
+      callback(error);
+    }
   }
 
-  handleOnGetSpeed(callback: CharacteristicGetCallback) {
-    const operation = async () => {
+  async handleOnGetSpeed(callback: CharacteristicGetCallback) {
+    try {
       await this.ensureConnection();
       const response = await this.client.readHoldingRegisters(this.platform.speedRegister, 1);
-      const currentValue = response.data[0];
-      this.platform.log.debug('Speed is:', currentValue);
-      return currentValue;
-    };
-
-    this.executeWithTimeout(operation)
-      .then(value => callback(null, value))
-      .catch(error => {
-        this.platform.log.error('Error getting Speed:', error);
-        this.isConnected = false;
-        callback(error);
-      });
+      callback(null, response.data[0]);
+    } catch (error) {
+      this.platform.log.error('Error getting Speed:', error);
+      this.isConnected = false;
+      callback(error);
+    }
   }
 
-  handleOnSetSpeed(value: CharacteristicValue, callback: CharacteristicSetCallback) {
-    const operation = async () => {
+  async handleOnSetSpeed(value: CharacteristicValue, callback: CharacteristicSetCallback) {
+    try {
       await this.ensureConnection();
       const response = await this.client.readHoldingRegisters(this.platform.regimeRegister, 1);
-      const state = response.data[0];
       
-      if (state === 0) {
+      if (response.data[0] === 0) {
         await this.client.writeRegister(this.platform.regimeRegister, 2);
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
       
       await this.client.writeRegister(this.platform.speedRegister, value as number);
-      this.platform.log.debug(`Set Speed to: ${value}`);
-    };
-
-    this.executeWithTimeout(operation)
-      .then(() => callback(null))
-      .catch(error => {
-        this.platform.log.error('Error setting Speed:', error);
-        this.isConnected = false;
-        callback(error);
-      });
+      callback(null);
+    } catch (error) {
+      this.platform.log.error('Error setting Speed:', error);
+      this.isConnected = false;
+      callback(error);
+    }
   }
 }
