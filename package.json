@@ -2,7 +2,7 @@
   "private": false,
   "displayName": "AtreaHRU",
   "name": "homebridge-atrea",
-  "version": "2.0.12",
+  "version": "2.0.13",
   "description": "Connection of Atrea Heat Recovery Unit.",
   "license": "Apache-2.0",
   "repository": {
