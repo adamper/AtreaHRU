@@ -3,10 +3,11 @@ import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import { HRUAccessory } from './platformAccessory';
 
 export class HRUPlatform implements DynamicPlatformPlugin {
-  public readonly Service: typeof Service = this.api.hap.Service;
-  public readonly Characteristic: typeof Characteristic = this.api.hap.Characteristic;
+  public readonly Service: typeof Service;
+  public readonly Characteristic: typeof Characteristic;
 
   public readonly accessories: PlatformAccessory[] = [];
+  private readonly hruAccessories: HRUAccessory[] = [];
 
   public ip: string;
   public port: number;
@@ -18,6 +19,9 @@ export class HRUPlatform implements DynamicPlatformPlugin {
     public readonly config: PlatformConfig,
     public readonly api: API,
   ) {
+    // Nejdříve přiřadíme Service a Characteristic
+    this.Service = this.api.hap.Service;
+    this.Characteristic = this.api.hap.Characteristic;
     this.ip = config.ip || '192.168.0.20';
     this.port = config.port || 502;
     this.regimeRegister = config.regimeRegister || 1001;
@@ -29,6 +33,16 @@ export class HRUPlatform implements DynamicPlatformPlugin {
       log.debug('Executed didFinishLaunching callback');
       this.discoverDevices();
     });
+
+    // Cleanup při ukončení
+    this.api.on('shutdown', () => {
+      this.log.debug('Platform shutdown initiated');
+      this.cleanup();
+    });
+
+    // Backup cleanup pro případ, že shutdown event nebude volán
+    process.on('SIGTERM', this.cleanup.bind(this));
+    process.on('SIGINT', this.cleanup.bind(this));
   }
 
   configureAccessory(accessory: PlatformAccessory) {
@@ -42,12 +56,29 @@ export class HRUPlatform implements DynamicPlatformPlugin {
 
     if (existingAccessory) {
       this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-      new HRUAccessory(this, existingAccessory);
+      const hruAccessory = new HRUAccessory(this, existingAccessory);
+      this.hruAccessories.push(hruAccessory);
     } else {
       this.log.info('Adding new accessory');
       const accessory = new this.api.platformAccessory('HRU Device', uuid);
-      new HRUAccessory(this, accessory);
+      const hruAccessory = new HRUAccessory(this, accessory);
+      this.hruAccessories.push(hruAccessory);
       this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     }
+  }
+
+  private cleanup(): void {
+    this.log.debug('Cleaning up platform...');
+    
+    // Odpojíme všechny HRU accessory
+    this.hruAccessories.forEach(accessory => {
+      try {
+        accessory.disconnect();
+      } catch (error) {
+        this.log.debug('Error disconnecting accessory:', error);
+      }
+    });
+    
+    this.hruAccessories.length = 0;
   }
 }
