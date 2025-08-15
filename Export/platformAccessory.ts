@@ -65,8 +65,14 @@ export class HRUAccessory {
   private readonly heartbeatInterval: number;
   private readonly cacheTimeout: number;
   private readonly connectionTimeout: number;
-  private readonly operationTimeout: number = 15000;
+  private readonly operationTimeout: number = 20000; // ↑ z 15000 na 20000ms
   private readonly maxConcurrentOperations: number = 3;
+  
+  // 🔧 NOVÉ: Konstanty pro "device busy" chybu
+  private readonly MODBUS_DEVICE_BUSY_CODE = 6;
+  private readonly DEVICE_BUSY_BACKOFF_BASE = 3000; // 3 sekundy base
+  private readonly DEVICE_BUSY_MAX_BACKOFF = 15000; // max 15 sekund
+  private deviceBusyCount = 0;
   
   // State management
   private connectionRetryCount: number = 0;
@@ -101,11 +107,12 @@ export class HRUAccessory {
     this.checkForDuplicateConnections();
     
     // Extract configuration with safe defaults
-    this.operationThrottle = this.platform.operationThrottle || 1000; // Increased default
-    this.maxRetries = this.platform.maxRetries || 3; // Reduced default
-    this.heartbeatInterval = this.platform.heartbeatInterval || 60000; // Increased default
-    this.cacheTimeout = this.platform.cacheTimeout || 3000; // Increased default
-    this.connectionTimeout = this.platform.connectionTimeout || 10000; // Increased default
+    // 🔧 ZMĚNA: Optimalizované výchozí hodnoty z platform konfigurace
+    this.operationThrottle = this.platform.operationThrottle || 2500; // ↑ z 1000 na 2500ms
+    this.maxRetries = this.platform.maxRetries || 2; // ↓ z 3 na 2
+    this.heartbeatInterval = this.platform.heartbeatInterval || 120000; // ↑ z 60000 na 120000ms
+    this.cacheTimeout = this.platform.cacheTimeout || 8000; // ↑ z 3000 na 8000ms
+    this.connectionTimeout = this.platform.connectionTimeout || 15000; // ↑ z 10000 na 15000ms
     
     // Register this instance
     HRUAccessory.instanceCount++;
@@ -374,6 +381,24 @@ export class HRUAccessory {
     }
   }
 
+  // **🔧 NOVÉ METODY PRO ZPRACOVÁNÍ "DEVICE BUSY" CHYBY**
+  
+  private isDeviceBusyError(error: any): boolean {
+    return error && 
+           typeof error === 'object' && 
+           'modbusCode' in error && 
+           error.modbusCode === this.MODBUS_DEVICE_BUSY_CODE;
+  }
+
+  private calculateDeviceBusyBackoff(): number {
+    this.deviceBusyCount++;
+    const backoff = Math.min(
+      this.DEVICE_BUSY_BACKOFF_BASE * Math.pow(1.5, this.deviceBusyCount - 1),
+      this.DEVICE_BUSY_MAX_BACKOFF
+    );
+    return backoff + (Math.random() * 1000); // Přidat jitter
+  }
+
   // **SAFE OPERATION QUEUE WITH CONCURRENCY LIMITS**
   
   private async addToQueue<T>(operation: () => Promise<T>, priority: boolean = false): Promise<T> {
@@ -415,6 +440,7 @@ export class HRUAccessory {
     });
   }
 
+  // 🔧 UPRAVENÁ METODA: Pomalejší processQueue s větším throttling
   private async processQueue(): Promise<void> {
     if (this.isProcessingQueue || this.operationQueue.length === 0 || this.isCleaningUp) {
       return;
@@ -427,11 +453,15 @@ export class HRUAccessory {
         const operation = this.operationQueue.shift();
         if (!operation) break;
 
-        // Strict throttling
+        // ↑ ZPŘÍSNĚNO: Throttling s minimálním intervalem
         const now = Date.now();
         const timeSinceLastOperation = now - this.lastOperation;
-        if (timeSinceLastOperation < this.operationThrottle) {
-          await this.sleep(this.operationThrottle - timeSinceLastOperation);
+        const requiredDelay = Math.max(this.operationThrottle, 2000); // Min 2 sekundy
+        
+        if (timeSinceLastOperation < requiredDelay) {
+          const waitTime = requiredDelay - timeSinceLastOperation;
+          this.platform.log.debug(`${this.instanceId}: Throttling operation, waiting ${waitTime}ms`);
+          await this.sleep(waitTime);
         }
 
         try {
@@ -439,17 +469,27 @@ export class HRUAccessory {
           this.updateConnectionHealth(true);
         } catch (error) {
           this.updateConnectionHealth(false);
-          this.platform.log.error(`${this.instanceId}: Queue operation failed:`, error);
+          
+          if (this.isDeviceBusyError(error)) {
+            this.platform.log.warn(`${this.instanceId}: Queue operation failed with device busy error`);
+          } else {
+            this.platform.log.error(`${this.instanceId}: Queue operation failed:`, error);
+          }
         }
 
         this.lastOperation = Date.now();
+        
+        // PŘIDÁNO: Extra pauza mezi operacemi v queue
+        if (this.operationQueue.length > 0) {
+          await this.sleep(500);
+        }
       }
     } finally {
       this.isProcessingQueue = false;
     }
   }
 
-  // **SAFE RETRY MECHANISM**
+  // **🔧 UPRAVENÁ METODA: Enhanced retry s device busy zpracováním**
   
   private async executeWithRetry<T>(operation: () => Promise<T>): Promise<T> {
     return this.addToQueue(async () => {
@@ -470,14 +510,40 @@ export class HRUAccessory {
       }
 
       try {
-        return await operation();
+        const result = await operation();
+        // ÚSPĚCH: Reset device busy counter
+        this.deviceBusyCount = 0;
+        return result;
       } catch (error) {
+        // NOVÉ: Speciální zpracování "device busy" chyby
+        if (this.isDeviceBusyError(error)) {
+          const backoffTime = this.calculateDeviceBusyBackoff();
+          this.platform.log.warn(`${this.instanceId}: Device busy (attempt ${this.deviceBusyCount}), waiting ${Math.round(backoffTime)}ms before retry`);
+          
+          await this.sleep(backoffTime);
+          
+          // Pokus o znovuprovedení operace po backoff
+          if (this.deviceBusyCount <= 3) { // Max 3 pokusy pro device busy
+            try {
+              const result = await operation();
+              this.deviceBusyCount = 0; // Reset při úspěchu
+              return result;
+            } catch (retryError) {
+              if (this.isDeviceBusyError(retryError)) {
+                throw new Error(`Device persistently busy after ${this.deviceBusyCount} attempts. Please check device load.`);
+              }
+              throw retryError;
+            }
+          } else {
+            throw new Error(`Device busy limit exceeded (${this.deviceBusyCount} attempts)`);
+          }
+        }
+
+        // Standardní error handling pro ostatní chyby
         this.platform.log.debug(`${this.instanceId}: Operation failed, attempting recovery:`, error);
-        
-        // Single recovery attempt
         this.handleConnectionFailure();
         
-        // Try once more after recovery
+        // Single recovery attempt
         await this.connectModbusClient();
         if (this.connectionState.isConnected) {
           return await operation();
@@ -622,6 +688,7 @@ export class HRUAccessory {
     );
   }
 
+  // 🔧 UPRAVENÁ METODA: Pomalejší handleOnSetOn s více čekání
   handleOnSetOn(value: CharacteristicValue, callback: CharacteristicSetCallback) {
     this.executeCharacteristicOperation(
       async () => {
@@ -630,14 +697,20 @@ export class HRUAccessory {
         }
         
         const setValue = (value as number) >= 1 ? 2 : 0;
+        
+        this.platform.log.debug(`${this.instanceId}: Setting device state to: ${value} (writing: ${setValue})`);
         await this.client.writeRegister(this.platform.regimeRegister, setValue);
+        
+        // PŘIDÁNO: Čekání po změně stavu
+        await this.sleep(1000);
         
         // Invalidate cache
         this.cache.delete(`read_${this.platform.regimeRegister}`);
         
-        this.platform.log.debug(`${this.instanceId}: Set state to: ${value} (wrote: ${setValue})`);
+        this.platform.log.debug(`${this.instanceId}: Device state set successfully`);
       },
-      callback
+      callback,
+      20000 // ↑ Zvýšený timeout
     );
   }
 
@@ -652,6 +725,7 @@ export class HRUAccessory {
     );
   }
 
+  // 🔧 UPRAVENÁ METODA: Pomalejší handleOnSetSpeed s více čekání
   handleOnSetSpeed(value: CharacteristicValue, callback: CharacteristicSetCallback) {
     this.executeCharacteristicOperation(
       async () => {
@@ -664,20 +738,39 @@ export class HRUAccessory {
         // Check if device is on, turn on if needed
         const state = await this.batchReadRegister(this.platform.regimeRegister);
         if (state === 0 && speed > 0) {
+          this.platform.log.debug(`${this.instanceId}: Turning device on before setting speed`);
           await this.client.writeRegister(this.platform.regimeRegister, 2);
-          await this.sleep(800); // Wait for device response
+          
+          // ↑ ZVÝŠENO: Čekání na response zařízení z 800ms na 1500ms
+          await this.sleep(1500);
+          
+          // Ověření, že se zařízení skutečně zapnulo
+          const newState = await this.batchReadRegister(this.platform.regimeRegister);
+          if (newState === 0) {
+            this.platform.log.warn(`${this.instanceId}: Device did not turn on, retrying...`);
+            await this.sleep(1000);
+            await this.client.writeRegister(this.platform.regimeRegister, 2);
+            await this.sleep(1500);
+          }
+        }
+        
+        // PŘIDÁNO: Extra čekání před nastavením rychlosti
+        if (state === 0 && speed > 0) {
+          await this.sleep(500); // Extra pause po zapnutí
         }
         
         // Set speed
+        this.platform.log.debug(`${this.instanceId}: Setting speed to ${speed}%`);
         await this.client.writeRegister(this.platform.speedRegister, speed);
         
         // Invalidate relevant cache
         this.cache.delete(`read_${this.platform.regimeRegister}`);
         this.cache.delete(`read_${this.platform.speedRegister}`);
         
-        this.platform.log.debug(`${this.instanceId}: Set speed to: ${speed}%`);
+        this.platform.log.debug(`${this.instanceId}: Speed set successfully to: ${speed}%`);
       },
-      callback
+      callback,
+      25000 // ↑ Zvýšený timeout z 20000 na 25000ms
     );
   }
 

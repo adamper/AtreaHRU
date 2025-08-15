@@ -92,15 +92,17 @@ export class HRUPlatform implements DynamicPlatformPlugin {
     this.validateConfiguration();
     
     // Set configuration with safe defaults
+    // 🔧 ZMĚNA: Zvýšené výchozí hodnoty pro stabilnější komunikaci s Atrea zařízeními
     this.ip = config.ip || '192.168.1.100';
     this.port = config.port || 502;
     this.regimeRegister = config.regimeRegister || 1000;
     this.speedRegister = config.speedRegister || 1001;
-    this.connectionTimeout = Math.max(config.connectionTimeout || 10000, 5000); // Min 5s
-    this.operationThrottle = Math.max(config.operationThrottle || 1000, 500); // Min 500ms
-    this.maxRetries = Math.min(Math.max(config.maxRetries || 3, 1), 10); // 1-10 range
-    this.heartbeatInterval = Math.max(config.heartbeatInterval || 60000, 30000); // Min 30s
-    this.cacheTimeout = Math.max(config.cacheTimeout || 3000, 1000); // Min 1s
+    this.connectionTimeout = Math.max(config.connectionTimeout || 15000, 5000); // ↑ z 10000 na 15000ms
+    this.operationThrottle = Math.max(config.operationThrottle || 2500, 500); // ↑ z 1000 na 2500ms
+    this.maxRetries = Math.min(Math.max(config.maxRetries || 2, 1), 10); // ↓ z 3 na 2
+    this.heartbeatInterval = Math.max(config.heartbeatInterval || 120000, 30000); // ↑ z 60000 na 120000ms (2min)
+    this.cacheTimeout = Math.max(config.cacheTimeout || 8000, 1000); // ↑ z 3000 na 8000ms
+
     this.deviceName = config.name || config.deviceName || 'ATREA HRU';
 
     // Enhanced configuration logging
